@@ -102,6 +102,30 @@ DDP features:
 - Distributed validation with `--eval-freq N`
 - Multi-node training supported via `torchrun`
 
+**[Optional] Modernized Transformer Architecture (v2)**
+
+This fork includes a modernized transformer backbone (`convTransformerv2`) with recent advances:
+
+| Feature | Description | Benefit |
+|---------|-------------|---------|
+| **Flash Attention** | PyTorch 2.0+ `scaled_dot_product_attention` | 2-4x faster, O(T) memory |
+| **RoPE** | Rotary Position Embeddings | Better length generalization |
+| **RMSNorm** | Root Mean Square normalization | Faster than LayerNorm |
+| **SwiGLU** | Gated Linear Unit FFN | Better quality per parameter |
+| **GQA** | Grouped Query Attention | Faster inference |
+
+To use the v2 backbone, update your config:
+```yaml
+model:
+  backbone_type: convTransformerv2
+  backbone:
+    use_rope: true
+    use_flash_attn: true
+    use_swiglu: true
+    use_rms_norm: true
+    use_abs_pe: false  # RoPE handles position
+```
+
 * [Optional] Monitor the training using TensorBoard
 ```shell
 tensorboard --logdir=./ckpt/thumos_i3d_reproduce/logs

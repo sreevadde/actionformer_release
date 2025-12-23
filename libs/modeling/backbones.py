@@ -3,8 +3,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from .models import register_backbone
-from .blocks import (get_sinusoid_encoding, TransformerBlock, MaskedConv1D,
-                     ConvBlock, LayerNorm)
+from .blocks import (get_sinusoid_encoding, TransformerBlock, TransformerBlockv2,
+                     MaskedConv1D, ConvBlock, LayerNorm, RMSNorm)
 
 
 @register_backbone("convTransformer")
@@ -258,6 +258,173 @@ class ConvBackbone(nn.Module):
         out_masks = (mask, )
 
         # main branch with downsampling
+        for idx in range(len(self.branch)):
+            x, mask = self.branch[idx](x, mask)
+            out_feats += (x, )
+            out_masks += (mask, )
+
+        return out_feats, out_masks
+
+
+@register_backbone("convTransformerv2")
+class ConvTransformerBackbonev2(nn.Module):
+    """
+    Modernized backbone with:
+    - Flash Attention (PyTorch 2.0+)
+    - RoPE (Rotary Position Embeddings)
+    - RMSNorm
+    - SwiGLU FFN
+    - Optional GQA (Grouped Query Attention)
+    """
+    def __init__(
+        self,
+        n_in,
+        n_embd,
+        n_head,
+        n_kv_head=None,        # for GQA (None = standard MHA)
+        n_embd_ks=3,
+        max_len=2048,
+        arch=(2, 2, 5),
+        mha_win_size=[-1]*6,
+        scale_factor=2,
+        with_ln=False,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        use_abs_pe=False,      # absolute PE (sinusoidal) - usually False with RoPE
+        use_rope=True,         # rotary position embeddings
+        use_flash_attn=True,   # use Flash Attention if available
+        use_swiglu=True,       # use SwiGLU FFN
+        use_rms_norm=True,     # use RMSNorm instead of LayerNorm
+    ):
+        super().__init__()
+        assert len(arch) == 3
+        assert len(mha_win_size) == (1 + arch[2])
+        self.n_in = n_in
+        self.arch = arch
+        self.mha_win_size = mha_win_size
+        self.max_len = max_len
+        self.relu = nn.ReLU(inplace=True)
+        self.scale_factor = scale_factor
+        self.use_abs_pe = use_abs_pe
+
+        # Feature projection
+        if isinstance(n_in, (list, tuple)):
+            assert isinstance(n_embd, (list, tuple)) and len(n_in) == len(n_embd)
+            self.proj = nn.ModuleList([
+                MaskedConv1D(c0, c1, 1) for c0, c1 in zip(n_in, n_embd)
+            ])
+            n_in = n_embd = sum(n_embd)
+        else:
+            self.proj = None
+
+        # Embedding network using convs
+        norm_cls = RMSNorm if use_rms_norm else LayerNorm
+        self.embd = nn.ModuleList()
+        self.embd_norm = nn.ModuleList()
+        for idx in range(arch[0]):
+            n_in_layer = n_embd if idx > 0 else n_in
+            self.embd.append(
+                MaskedConv1D(
+                    n_in_layer, n_embd, n_embd_ks,
+                    stride=1, padding=n_embd_ks//2, bias=(not with_ln)
+                )
+            )
+            if with_ln:
+                self.embd_norm.append(norm_cls(n_embd))
+            else:
+                self.embd_norm.append(nn.Identity())
+
+        # Position embedding (only if use_abs_pe, otherwise RoPE handles it)
+        if self.use_abs_pe:
+            pos_embd = get_sinusoid_encoding(self.max_len, n_embd) / (n_embd**0.5)
+            self.register_buffer("pos_embd", pos_embd, persistent=False)
+
+        # Stem network using modernized transformer
+        self.stem = nn.ModuleList()
+        for idx in range(arch[1]):
+            self.stem.append(
+                TransformerBlockv2(
+                    n_embd, n_head,
+                    n_kv_head=n_kv_head,
+                    n_ds_strides=(1, 1),
+                    attn_pdrop=attn_pdrop,
+                    proj_pdrop=proj_pdrop,
+                    path_pdrop=path_pdrop,
+                    mha_win_size=self.mha_win_size[0],
+                    max_seq_len=max_len,
+                    use_rope=use_rope,
+                    use_flash_attn=use_flash_attn,
+                    use_swiglu=use_swiglu,
+                    use_rms_norm=use_rms_norm,
+                )
+            )
+
+        # Main branch using transformer with pooling
+        self.branch = nn.ModuleList()
+        for idx in range(arch[2]):
+            self.branch.append(
+                TransformerBlockv2(
+                    n_embd, n_head,
+                    n_kv_head=n_kv_head,
+                    n_ds_strides=(self.scale_factor, self.scale_factor),
+                    attn_pdrop=attn_pdrop,
+                    proj_pdrop=proj_pdrop,
+                    path_pdrop=path_pdrop,
+                    mha_win_size=self.mha_win_size[1 + idx],
+                    max_seq_len=max_len // (scale_factor ** (idx + 1)),
+                    use_rope=use_rope,
+                    use_flash_attn=use_flash_attn,
+                    use_swiglu=use_swiglu,
+                    use_rms_norm=use_rms_norm,
+                )
+            )
+
+        self.apply(self.__init_weights__)
+
+    def __init_weights__(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            if module.bias is not None:
+                torch.nn.init.constant_(module.bias, 0.)
+
+    def forward(self, x, mask):
+        B, C, T = x.size()
+
+        # Feature projection
+        if isinstance(self.n_in, (list, tuple)):
+            x = torch.cat(
+                [proj(s, mask)[0]
+                    for proj, s in zip(self.proj, x.split(self.n_in, dim=1))
+                ], dim=1
+            )
+
+        # Embedding network
+        for idx in range(len(self.embd)):
+            x, mask = self.embd[idx](x, mask)
+            x = self.relu(self.embd_norm[idx](x))
+
+        # Absolute position embedding (if enabled)
+        if self.use_abs_pe:
+            if self.training:
+                assert T <= self.max_len, "Reached max length."
+                pe = self.pos_embd
+            else:
+                if T >= self.max_len:
+                    pe = F.interpolate(
+                        self.pos_embd, T, mode='linear', align_corners=False)
+                else:
+                    pe = self.pos_embd
+            x = x + pe[:, :, :T] * mask.to(x.dtype)
+
+        # Stem transformer
+        for idx in range(len(self.stem)):
+            x, mask = self.stem[idx](x, mask)
+
+        # Outputs
+        out_feats = (x, )
+        out_masks = (mask, )
+
+        # Main branch with downsampling
         for idx in range(len(self.branch)):
             x, mask = self.branch[idx](x, mask)
             out_feats += (x, )

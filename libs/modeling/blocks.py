@@ -6,6 +6,9 @@ import torch.nn.functional as F
 from torch import nn
 from .weight_init import trunc_normal_
 
+# Check for Flash Attention support (PyTorch 2.0+)
+HAS_FLASH_ATTN = hasattr(F, 'scaled_dot_product_attention')
+
 
 class MaskedConv1D(nn.Module):
     """
@@ -105,6 +108,62 @@ class LayerNorm(nn.Module):
         return out
 
 
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm)
+    Simpler and faster than LayerNorm - used in LLaMA, Mistral, etc.
+    """
+    def __init__(
+        self,
+        num_channels,
+        eps=1e-6,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        self.num_channels = num_channels
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones([1, num_channels, 1], **factory_kwargs))
+
+    def forward(self, x):
+        # x: (B, C, T)
+        rms = torch.sqrt(torch.mean(x ** 2, dim=1, keepdim=True) + self.eps)
+        return (x / rms) * self.weight
+
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU activation for FFN - better quality than GELU MLP
+    Used in LLaMA, PaLM, etc.
+    FFN(x) = (xW1 * SiLU(xV)) W2
+    """
+    def __init__(
+        self,
+        n_embd,
+        n_hidden=None,
+        n_out=None,
+        dropout=0.0,
+    ):
+        super().__init__()
+        if n_hidden is None:
+            # SwiGLU uses 2/3 of the 4x hidden dim to maintain param count
+            n_hidden = int(4 * n_embd * 2 / 3)
+            # Round to multiple of 64 for efficiency
+            n_hidden = ((n_hidden + 63) // 64) * 64
+        if n_out is None:
+            n_out = n_embd
+
+        self.w1 = nn.Conv1d(n_embd, n_hidden, 1)
+        self.w2 = nn.Conv1d(n_hidden, n_out, 1)
+        self.w3 = nn.Conv1d(n_embd, n_hidden, 1)  # gate
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # SwiGLU: (x @ W1) * SiLU(x @ W3) @ W2
+        return self.dropout(self.w2(F.silu(self.w3(x)) * self.w1(x)))
+
+
 # helper functions for Transformer blocks
 def get_sinusoid_encoding(n_position, d_hid):
     ''' Sinusoid position encoding table '''
@@ -118,6 +177,54 @@ def get_sinusoid_encoding(n_position, d_hid):
 
     # return a tensor of size 1 C T
     return torch.FloatTensor(sinusoid_table).unsqueeze(0).transpose(1, 2)
+
+
+class RotaryPositionEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) - used in LLaMA, GPT-NeoX, etc.
+    Better generalization than sinusoidal PE, especially for longer sequences.
+    """
+    def __init__(self, dim, max_seq_len=2048, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        # Precompute the frequency bands
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        self._update_cos_sin_cache(max_seq_len)
+
+    def _update_cos_sin_cache(self, seq_len):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer('cos_cached', emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer('sin_cached', emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: (B, nh, T, hs)
+        if seq_len is None:
+            seq_len = x.shape[2]
+        if seq_len > self.max_seq_len_cached:
+            self._update_cos_sin_cache(seq_len)
+        return (
+            self.cos_cached[:, :, :seq_len, :],
+            self.sin_cached[:, :, :seq_len, :]
+        )
+
+
+def rotate_half(x):
+    """Rotate half the hidden dims of the input."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """Apply rotary position embeddings to query and key tensors."""
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 # attention / transformers
@@ -185,6 +292,105 @@ class MaskedMHA(nn.Module):
         out = out.transpose(2, 3).contiguous().view(B, C, -1)
 
         # output projection + skip connection
+        out = self.proj_drop(self.proj(out)) * mask.to(out.dtype)
+        return out, mask
+
+
+class MaskedMHAv2(nn.Module):
+    """
+    Modernized Multi Head Attention with:
+    - Flash Attention (PyTorch 2.0+) for O(T) memory and 2-4x speedup
+    - RoPE (Rotary Position Embeddings) for better generalization
+    - Optional GQA (Grouped Query Attention) for inference efficiency
+    """
+
+    def __init__(
+        self,
+        n_embd,
+        n_head,
+        n_kv_head=None,      # for GQA: num KV heads (None = standard MHA)
+        max_seq_len=2048,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        use_rope=True,
+        use_flash_attn=True,
+    ):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
+        self.n_channels = n_embd // n_head
+        self.scale = 1.0 / math.sqrt(self.n_channels)
+        self.use_rope = use_rope
+        self.use_flash_attn = use_flash_attn and HAS_FLASH_ATTN
+        self.attn_pdrop = attn_pdrop
+
+        # Query projection
+        self.query = nn.Conv1d(n_embd, n_embd, 1)
+        # Key/Value projections (may be smaller for GQA)
+        kv_dim = self.n_kv_head * self.n_channels
+        self.key = nn.Conv1d(n_embd, kv_dim, 1)
+        self.value = nn.Conv1d(n_embd, kv_dim, 1)
+
+        # RoPE
+        if use_rope:
+            self.rope = RotaryPositionEmbedding(self.n_channels, max_seq_len)
+        else:
+            self.rope = None
+
+        # Output projection
+        self.proj = nn.Conv1d(n_embd, n_embd, 1)
+        self.proj_drop = nn.Dropout(proj_pdrop)
+
+    def forward(self, x, mask):
+        B, C, T = x.size()
+
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+
+        # Reshape: (B, C, T) -> (B, nh, T, hs)
+        q = q.view(B, self.n_head, self.n_channels, T).transpose(2, 3)
+        k = k.view(B, self.n_kv_head, self.n_channels, T).transpose(2, 3)
+        v = v.view(B, self.n_kv_head, self.n_channels, T).transpose(2, 3)
+
+        # Apply RoPE
+        if self.rope is not None:
+            cos, sin = self.rope(q, T)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Expand KV heads for GQA
+        if self.n_kv_head != self.n_head:
+            n_rep = self.n_head // self.n_kv_head
+            k = k.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(B, self.n_head, T, -1)
+            v = v.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(B, self.n_head, T, -1)
+
+        # Create attention mask for Flash Attention
+        # mask: (B, 1, T) bool -> attn_mask: (B, 1, T, T) or None
+        if self.use_flash_attn:
+            # Flash attention with mask
+            attn_mask = mask[:, :, None, :].expand(-1, -1, T, -1)  # (B, 1, T, T)
+            attn_mask = attn_mask.masked_fill(~attn_mask, float('-inf'))
+            attn_mask = attn_mask.masked_fill(attn_mask == True, 0.0)
+
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_pdrop if self.training else 0.0,
+                scale=self.scale,
+            )
+        else:
+            # Standard attention
+            att = (q * self.scale) @ k.transpose(-2, -1)
+            att = att.masked_fill(~mask[:, :, None, :], float('-inf'))
+            att = F.softmax(att, dim=-1)
+            if self.attn_pdrop > 0 and self.training:
+                att = F.dropout(att, p=self.attn_pdrop)
+            out = att @ v
+
+        # Reshape back: (B, nh, T, hs) -> (B, C, T)
+        out = out.transpose(2, 3).contiguous().view(B, C, T)
         out = self.proj_drop(self.proj(out)) * mask.to(out.dtype)
         return out, mask
 
@@ -727,6 +933,123 @@ class TransformerBlock(nn.Module):
         # FFN
         out = out + self.drop_path_mlp(self.mlp(self.ln2(out)) * out_mask_float)
         # optionally add pos_embd to the output
+        if pos_embd is not None:
+            out += pos_embd * out_mask_float
+        return out, out_mask
+
+
+class TransformerBlockv2(nn.Module):
+    """
+    Modernized Transformer block with:
+    - RMSNorm (faster, used in LLaMA)
+    - Flash Attention + RoPE
+    - SwiGLU FFN (better quality)
+    - Optional GQA for inference efficiency
+    """
+    def __init__(
+        self,
+        n_embd,
+        n_head,
+        n_kv_head=None,        # for GQA
+        n_ds_strides=(1, 1),
+        n_out=None,
+        n_hidden=None,
+        attn_pdrop=0.0,
+        proj_pdrop=0.0,
+        path_pdrop=0.0,
+        mha_win_size=-1,
+        max_seq_len=2048,
+        use_rope=True,
+        use_flash_attn=True,
+        use_swiglu=True,
+        use_rms_norm=True,
+    ):
+        super().__init__()
+        assert len(n_ds_strides) == 2
+
+        if n_out is None:
+            n_out = n_embd
+
+        # Normalization layers
+        norm_cls = RMSNorm if use_rms_norm else LayerNorm
+        self.ln1 = norm_cls(n_embd)
+        self.ln2 = norm_cls(n_embd)
+
+        # Attention
+        if mha_win_size > 1:
+            # Local attention (keep original for now, could add RoPE later)
+            self.attn = LocalMaskedMHCA(
+                n_embd,
+                n_head,
+                window_size=mha_win_size,
+                n_qx_stride=n_ds_strides[0],
+                n_kv_stride=n_ds_strides[1],
+                attn_pdrop=attn_pdrop,
+                proj_pdrop=proj_pdrop,
+                use_rel_pe=use_rope
+            )
+        elif n_ds_strides[0] > 1 or n_ds_strides[1] > 1:
+            # Strided attention (keep original MaskedMHCA)
+            self.attn = MaskedMHCA(
+                n_embd,
+                n_head,
+                n_qx_stride=n_ds_strides[0],
+                n_kv_stride=n_ds_strides[1],
+                attn_pdrop=attn_pdrop,
+                proj_pdrop=proj_pdrop
+            )
+        else:
+            # Full attention with Flash + RoPE
+            self.attn = MaskedMHAv2(
+                n_embd,
+                n_head,
+                n_kv_head=n_kv_head,
+                max_seq_len=max_seq_len,
+                attn_pdrop=attn_pdrop,
+                proj_pdrop=proj_pdrop,
+                use_rope=use_rope,
+                use_flash_attn=use_flash_attn,
+            )
+
+        # Skip connection pooling
+        if n_ds_strides[0] > 1:
+            kernel_size = n_ds_strides[0] + 1
+            stride = n_ds_strides[0]
+            padding = (n_ds_strides[0] + 1) // 2
+            self.pool_skip = nn.MaxPool1d(kernel_size, stride=stride, padding=padding)
+        else:
+            self.pool_skip = nn.Identity()
+
+        # FFN
+        if use_swiglu:
+            self.mlp = SwiGLU(n_embd, n_hidden=n_hidden, n_out=n_out, dropout=proj_pdrop)
+        else:
+            if n_hidden is None:
+                n_hidden = 4 * n_embd
+            self.mlp = nn.Sequential(
+                nn.Conv1d(n_embd, n_hidden, 1),
+                nn.GELU(),
+                nn.Dropout(proj_pdrop, inplace=True),
+                nn.Conv1d(n_hidden, n_out, 1),
+                nn.Dropout(proj_pdrop, inplace=True),
+            )
+
+        # Drop path
+        if path_pdrop > 0.0:
+            self.drop_path_attn = AffineDropPath(n_embd, drop_prob=path_pdrop)
+            self.drop_path_mlp = AffineDropPath(n_out, drop_prob=path_pdrop)
+        else:
+            self.drop_path_attn = nn.Identity()
+            self.drop_path_mlp = nn.Identity()
+
+    def forward(self, x, mask, pos_embd=None):
+        # Pre-norm transformer
+        out, out_mask = self.attn(self.ln1(x), mask)
+        out_mask_float = out_mask.to(out.dtype)
+        out = self.pool_skip(x) * out_mask_float + self.drop_path_attn(out)
+        # FFN
+        out = out + self.drop_path_mlp(self.mlp(self.ln2(out)) * out_mask_float)
+        # RoPE handles position internally, but keep interface for compatibility
         if pos_embd is not None:
             out += pos_embd * out_mask_float
         return out, out_mask
