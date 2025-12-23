@@ -76,6 +76,20 @@ This folder
 ```shell
 python ./train.py ./configs/thumos_i3d.yaml --output reproduce
 ```
+
+**[Optional] Multi-GPU Training with DDP**
+
+For faster training on multiple GPUs, use DistributedDataParallel (DDP):
+```shell
+# Train on 4 GPUs
+torchrun --nproc_per_node=4 ./train_ddp.py ./configs/thumos_i3d.yaml --output reproduce
+
+# Train on 2 GPUs
+torchrun --nproc_per_node=2 ./train_ddp.py ./configs/thumos_i3d.yaml --output reproduce
+```
+
+DDP provides better scaling than DataParallel by running each GPU in its own process. Learning rate is automatically scaled by the number of GPUs (linear scaling rule).
+
 * [Optional] Monitor the training using TensorBoard
 ```shell
 tensorboard --logdir=./ckpt/thumos_i3d_reproduce/logs
