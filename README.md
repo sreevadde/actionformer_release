@@ -9,6 +9,7 @@
 | **Multi-GPU Training** | DDP, AMP, gradient accumulation | [Guide](docs/MULTI_GPU_TRAINING.md) |
 | **Transformer v2** | Flash Attention, RoPE, RMSNorm, SwiGLU | [Guide](docs/TRANSFORMER_V2.md) |
 | **Detection Quality** | EIoU, DIoU-NMS, temperature scaling | [Guide](docs/DETECTION_QUALITY.md) |
+| **Framework Utils** | Config validation, adaptive ranges, post-processing | [Guide](docs/FRAMEWORK_IMPROVEMENTS.md) |
 | **Use Cases** | Configuration recommendations | [Guide](docs/USE_CASES.md) |
 
 ### Quick Start
@@ -67,6 +68,24 @@ test_cfg:
   class_sigma:
     0: 0.7  # short events
     1: 0.4  # medium events
+```
+
+### Framework Utilities
+
+| Component | Description |
+|-----------|-------------|
+| **Config Validation** | Catch misconfigurations early (FPN alignment, sequence divisibility) |
+| **Adaptive Ranges** | Compute regression ranges from annotation distribution |
+| **Loss Logger** | Moving averages with IoU stats for debugging |
+| **Temporal Constraints** | Post-process with min gap, duration limits, overlap rules |
+
+```python
+from libs.core import validate_config, compute_adaptive_ranges
+from libs.utils import TemporalConstraints
+
+validate_config(cfg)  # Raises on invalid config
+ranges = compute_adaptive_ranges('annotations.json', num_levels=6)
+filtered = TemporalConstraints(min_gap={0: 5.0}).apply(results)
 ```
 
 ---

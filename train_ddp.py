@@ -235,12 +235,12 @@ def train_one_epoch_ddp(
             # Terminal output
             block1 = f'Epoch: [{curr_epoch:03d}][{iter_idx:05d}/{num_iters:05d}]'
             block2 = f'Time {batch_time.val:.2f} ({batch_time.avg:.2f})'
-            block3 = f'Loss {losses_tracker["final_loss"].val:.2f} ({losses_tracker["final_loss"].avg:.2f})'
+            block3 = f'Loss {losses_tracker["final_loss"].val:.4f} ({losses_tracker["final_loss"].avg:.4f})'
 
             loss_details = []
             for key, value in losses_tracker.items():
                 if key != "final_loss":
-                    loss_details.append(f'{key} {value.val:.2f} ({value.avg:.2f})')
+                    loss_details.append(f'{key} {value.val:.4f} ({value.avg:.4f})')
 
             print(f'\t{block1}\t{block2}\t{block3}')
             if loss_details:
