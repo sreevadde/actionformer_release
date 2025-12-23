@@ -81,14 +81,26 @@ python ./train.py ./configs/thumos_i3d.yaml --output reproduce
 
 For faster training on multiple GPUs, use DistributedDataParallel (DDP):
 ```shell
-# Train on 4 GPUs
+# Basic 4-GPU training
 torchrun --nproc_per_node=4 ./train_ddp.py ./configs/thumos_i3d.yaml --output reproduce
 
-# Train on 2 GPUs
-torchrun --nproc_per_node=2 ./train_ddp.py ./configs/thumos_i3d.yaml --output reproduce
+# With AMP (mixed precision) for ~2x faster training
+torchrun --nproc_per_node=4 ./train_ddp.py ./configs/thumos_i3d.yaml --amp --output reproduce
+
+# With gradient accumulation (effective_batch = batch_size × accum_steps × num_gpus)
+torchrun --nproc_per_node=4 ./train_ddp.py ./configs/thumos_i3d.yaml --accum-steps 2 --output reproduce
+
+# Full example with all features
+torchrun --nproc_per_node=4 ./train_ddp.py ./configs/thumos_i3d.yaml \
+    --amp --accum-steps 2 --eval-freq 5 --output reproduce
 ```
 
-DDP provides better scaling than DataParallel by running each GPU in its own process. Learning rate is automatically scaled by the number of GPUs (linear scaling rule).
+DDP features:
+- Automatic learning rate scaling by `num_gpus × accum_steps`
+- AMP (Automatic Mixed Precision) with `--amp` for faster training
+- Gradient accumulation with `--accum-steps N` for larger effective batch sizes
+- Distributed validation with `--eval-freq N`
+- Multi-node training supported via `torchrun`
 
 * [Optional] Monitor the training using TensorBoard
 ```shell
