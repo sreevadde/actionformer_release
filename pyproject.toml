@@ -1,6 +1,6 @@
 [project]
 name = "actionformer"
-version = "1.0.0"
+version = "1.0.1"
 description = "ActionFormer: Localizing Moments of Actions with Transformers"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,8 +17,8 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "wheel", "torch>=2.0.0"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["libs"]
+[tool.setuptools.packages.find]
+include = ["libs*"]
