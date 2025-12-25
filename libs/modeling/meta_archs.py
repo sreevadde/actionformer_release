@@ -6,7 +6,11 @@ from torch.nn import functional as F
 
 from .models import register_meta_arch, make_backbone, make_neck, make_generator
 from .blocks import MaskedConv1D, Scale, LayerNorm
-from .losses import ctr_diou_loss_1d, ctr_eiou_loss_1d, ctr_giou_loss_1d, sigmoid_focal_loss, gaussian_focal_loss
+from .losses import (
+    ctr_diou_loss_1d, ctr_eiou_loss_1d, ctr_giou_loss_1d,
+    sigmoid_focal_loss, gaussian_focal_loss,
+    distribution_focal_loss
+)
 
 from ..utils import batched_nms
 
@@ -320,6 +324,83 @@ class PtTransformerRegHead(nn.Module):
 
         # fpn_masks remains the same
         return out_offsets
+
+
+class PtTransformerBDRHead(nn.Module):
+    """
+    Boundary Distribution Regression (BDR) Head from TBT-Former.
+
+    Instead of regressing scalar offsets, predicts probability distribution
+    over discrete bins. Final offset is computed as expectation.
+    """
+    def __init__(
+        self,
+        input_dim,
+        feat_dim,
+        fpn_levels,
+        num_layers=3,
+        kernel_size=3,
+        act_layer=nn.ReLU,
+        with_ln=False,
+        reg_max=16,
+    ):
+        super().__init__()
+        self.fpn_levels = fpn_levels
+        self.act = act_layer()
+        self.reg_max = reg_max
+        self.num_bins = reg_max + 1
+
+        self.head = nn.ModuleList()
+        self.norm = nn.ModuleList()
+        for idx in range(num_layers - 1):
+            in_dim = input_dim if idx == 0 else feat_dim
+            self.head.append(
+                MaskedConv1D(
+                    in_dim, feat_dim, kernel_size,
+                    stride=1, padding=kernel_size // 2, bias=(not with_ln)
+                )
+            )
+            self.norm.append(LayerNorm(feat_dim) if with_ln else nn.Identity())
+
+        self.scale = nn.ModuleList([Scale() for _ in range(fpn_levels)])
+
+        # Output: 2 boundaries x (reg_max + 1) bins
+        self.dist_head = MaskedConv1D(
+            feat_dim, 2 * self.num_bins, kernel_size,
+            stride=1, padding=kernel_size // 2
+        )
+
+        # Precompute bins for decoding
+        self.register_buffer('bins', torch.arange(self.num_bins, dtype=torch.float32))
+
+    def forward(self, fpn_feats, fpn_masks):
+        assert len(fpn_feats) == self.fpn_levels
+
+        out_offsets = tuple()
+        out_dists = tuple()
+
+        for l, (cur_feat, cur_mask) in enumerate(zip(fpn_feats, fpn_masks)):
+            cur_out = cur_feat
+            for idx in range(len(self.head)):
+                cur_out, _ = self.head[idx](cur_out, cur_mask)
+                cur_out = self.act(self.norm[idx](cur_out))
+
+            # Predict distribution: B, 2*(reg_max+1), T
+            cur_dists, _ = self.dist_head(cur_out, cur_mask)
+            B, _, T = cur_dists.shape
+
+            # Reshape to B, T, 2, num_bins
+            cur_dists = cur_dists.permute(0, 2, 1).reshape(B, T, 2, self.num_bins)
+
+            # Decode to offsets via expectation
+            probs = F.softmax(cur_dists, dim=-1)
+            cur_offsets = (probs * self.bins).sum(dim=-1)  # B, T, 2
+            cur_offsets = cur_offsets.permute(0, 2, 1)  # B, 2, T
+
+            out_offsets += (F.relu(self.scale[l](cur_offsets)),)
+            out_dists += (cur_dists,)
+
+        return out_offsets, out_dists
 
 
 @register_meta_arch("LocPointTransformer")
@@ -1196,3 +1277,133 @@ class SnapFormer(PtTransformer):
             })
 
         return results
+
+
+@register_meta_arch("TBTFormer")
+class TBTFormer(PtTransformer):
+    """
+    TBT-Former: ActionFormer with Boundary Distribution Regression.
+
+    Uses probabilistic boundary prediction via DFL instead of direct regression.
+    Better handles label noise and boundary uncertainty.
+    """
+    def __init__(self, reg_max=16, dfl_weight=0.25, **kwargs):
+        super().__init__(**kwargs)
+        self.reg_max = reg_max
+        self.dfl_weight = dfl_weight
+
+        # Replace regression head with BDR head
+        self.reg_head = PtTransformerBDRHead(
+            self.neck.out_channel,
+            kwargs['head_dim'],
+            len(self.fpn_strides),
+            num_layers=kwargs['head_num_layers'],
+            kernel_size=kwargs['head_kernel_size'],
+            with_ln=kwargs['head_with_ln'],
+            reg_max=reg_max,
+        )
+
+    def forward(self, video_list):
+        batched_inputs, batched_masks = self.preprocessing(video_list)
+        feats, masks = self.backbone(batched_inputs, batched_masks)
+        fpn_feats, fpn_masks = self.neck(feats, masks)
+
+        points = self.point_generator(fpn_feats)
+        out_cls_logits = self.cls_head(fpn_feats, fpn_masks)
+        out_offsets, out_dists = self.reg_head(fpn_feats, fpn_masks)
+
+        out_cls_logits = [x.permute(0, 2, 1) for x in out_cls_logits]
+        out_offsets = [x.permute(0, 2, 1) for x in out_offsets]
+        fpn_masks = [x.squeeze(1) for x in fpn_masks]
+
+        if self.training:
+            gt_segments = [x['segments'].to(self.device) for x in video_list]
+            gt_labels = [x['labels'].to(self.device) for x in video_list]
+
+            gt_cls_labels, gt_offsets = self.label_points(
+                points, gt_segments, gt_labels
+            )
+
+            losses = self.losses(
+                fpn_masks,
+                out_cls_logits, out_offsets, out_dists,
+                gt_cls_labels, gt_offsets,
+                points
+            )
+            return losses
+        else:
+            return self.inference(
+                video_list, points, fpn_masks,
+                out_cls_logits, out_offsets
+            )
+
+    def losses(
+        self, fpn_masks,
+        out_cls_logits, out_offsets, out_dists,
+        gt_cls_labels, gt_offsets,
+        points
+    ):
+        # Classification and standard regression losses from parent
+        valid_mask = torch.cat(fpn_masks, dim=1)
+        pos_mask = torch.cat(gt_cls_labels, dim=1) > 0
+
+        pred_offsets = torch.cat(out_offsets, dim=1)[valid_mask]
+        gt_offsets_cat = torch.cat(gt_offsets, dim=1)[valid_mask]
+        pos_mask_flat = pos_mask[valid_mask]
+
+        # Classification loss
+        pred_cls = torch.cat(out_cls_logits, dim=1)[valid_mask]
+        gt_cls = torch.cat(gt_cls_labels, dim=1)[valid_mask]
+        cls_loss = sigmoid_focal_loss(pred_cls, gt_cls.float(), reduction='sum')
+
+        num_pos = pos_mask_flat.sum().clamp(min=1)
+
+        # IoU regression loss (on decoded offsets)
+        if pos_mask_flat.any():
+            pos_pred = pred_offsets[pos_mask_flat]
+            pos_gt = gt_offsets_cat[pos_mask_flat]
+            reg_loss = ctr_diou_loss_1d(pos_pred, pos_gt, reduction='sum')
+
+            # DFL loss on distributions
+            dfl_loss = self._compute_dfl_loss(
+                out_dists, gt_offsets, fpn_masks, pos_mask
+            )
+        else:
+            reg_loss = pred_offsets.new_tensor(0.0)
+            dfl_loss = pred_offsets.new_tensor(0.0)
+
+        return {
+            'cls_loss': cls_loss / num_pos,
+            'reg_loss': reg_loss / num_pos,
+            'dfl_loss': dfl_loss * self.dfl_weight / num_pos,
+        }
+
+    def _compute_dfl_loss(self, out_dists, gt_offsets, fpn_masks, pos_mask):
+        dfl_loss = 0.0
+        offset_idx = 0
+
+        for level_idx, dists in enumerate(out_dists):
+            mask = fpn_masks[level_idx]
+            level_len = mask.shape[1]
+            level_pos = pos_mask[:, offset_idx:offset_idx + level_len]
+            level_gt = gt_offsets[level_idx]
+
+            if level_pos.any():
+                # dists: B, T, 2, num_bins
+                valid_dists = dists[mask][level_pos[mask]]  # N_pos, 2, num_bins
+                valid_gt = level_gt[mask][level_pos[mask]]  # N_pos, 2
+
+                # Scale GT to bin range [0, reg_max]
+                valid_gt_scaled = valid_gt.clamp(0, self.reg_max)
+
+                # DFL for start and end
+                dfl_loss += distribution_focal_loss(
+                    valid_dists[:, 0, :], valid_gt_scaled[:, 0], self.reg_max
+                ).sum()
+                dfl_loss += distribution_focal_loss(
+                    valid_dists[:, 1, :], valid_gt_scaled[:, 1], self.reg_max
+                ).sum()
+
+            offset_idx += level_len
+
+        return dfl_loss

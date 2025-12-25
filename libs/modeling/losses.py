@@ -465,3 +465,49 @@ def gaussian_focal_loss(
         loss = -(pos_loss + neg_loss) / num_pos
 
     return loss
+
+
+@torch.jit.script
+def distribution_focal_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    reg_max: int = 16,
+) -> torch.Tensor:
+    """
+    Distribution Focal Loss (DFL) from Generalized Focal Loss.
+
+    Learns discrete probability distribution over regression bins.
+    Final prediction is expectation over the distribution.
+
+    Args:
+        pred: Predicted distribution logits, shape (N, reg_max + 1)
+        target: Continuous regression target, shape (N,), values in [0, reg_max]
+        reg_max: Maximum regression range (number of bins - 1)
+    """
+    target = target.clamp(0, reg_max - 0.01)
+    left = target.long()
+    right = left + 1
+    weight_left = right.float() - target
+    weight_right = target - left.float()
+
+    loss = (
+        F.cross_entropy(pred, left, reduction='none') * weight_left +
+        F.cross_entropy(pred, right, reduction='none') * weight_right
+    )
+    return loss
+
+
+def decode_distribution(pred: torch.Tensor, reg_max: int = 16) -> torch.Tensor:
+    """
+    Decode distribution prediction to scalar offset.
+
+    Args:
+        pred: Distribution logits, shape (..., reg_max + 1)
+        reg_max: Maximum regression range
+
+    Returns:
+        Scalar offset as expectation over distribution
+    """
+    bins = torch.arange(reg_max + 1, device=pred.device, dtype=pred.dtype)
+    probs = F.softmax(pred, dim=-1)
+    return (probs * bins).sum(dim=-1)

@@ -10,6 +10,7 @@
 | **Transformer v2** | Flash Attention, RoPE, RMSNorm, SwiGLU | [Guide](docs/TRANSFORMER_V2.md) |
 | **Detection Quality** | EIoU, DIoU-NMS, temperature scaling | [Guide](docs/DETECTION_QUALITY.md) |
 | **SnapFormer** | Heatmap-based point detection for instant events | [Config](#snapformer-point-detection) |
+| **TBTFormer** | Boundary Distribution Regression for noisy labels | [Config](#tbtformer-boundary-distribution) |
 | **Framework Utils** | Config validation, adaptive ranges, post-processing | [Guide](docs/FRAMEWORK_IMPROVEMENTS.md) |
 | **Use Cases** | Configuration recommendations | [Guide](docs/USE_CASES.md) |
 
@@ -97,6 +98,34 @@ model:
 model:
   meta_arch: "LocPointTransformer"
   fpn_type: "fpn"             # Standard top-down FPN
+```
+
+### TBTFormer (Boundary Distribution)
+
+For action segmentation with **noisy annotations** or **uncertain boundaries**, TBTFormer uses probabilistic boundary regression instead of direct offset prediction.
+
+| Component | Description |
+|-----------|-------------|
+| **BDR Head** | Predicts probability distribution over boundary locations |
+| **Distribution Focal Loss** | Cross-entropy over adjacent bins for smooth learning |
+| **Scaled Backbone** | Optional 16 heads, 6x MLP for larger capacity |
+
+**When to use TBTFormer vs ActionFormer:**
+- **TBTFormer**: Datasets with annotation noise, ambiguous boundaries
+- **ActionFormer**: Clean annotations, well-defined action boundaries
+
+```yaml
+# TBTFormer config
+model:
+  meta_arch: "TBTFormer"
+  fpn_type: "cs_fpn"          # Cross-scale FPN recommended
+  reg_max: 16                 # Distribution bins (default: 16)
+  dfl_weight: 0.25            # DFL loss weight
+
+  # Optional: Scaled backbone (TBT-Former paper settings)
+  backbone:
+    n_head: 16                # Default: 8
+    n_hidden: 1536            # 6x embed dim (default: 4x = 1024)
 ```
 
 ### Framework Utilities
