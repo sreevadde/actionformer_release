@@ -7,6 +7,11 @@ This guide helps you choose the right configuration for your specific use case.
 ```
 Start
   │
+  ├─ What type of events are you detecting?
+  │   ├─ Point/instant events (duration ≈ 0) → SnapFormer
+  │   ├─ Segments with noisy labels → TBTFormer
+  │   └─ Segments with clean labels → ActionFormer (LocPointTransformer)
+  │
   ├─ Do you have multiple GPUs?
   │   ├─ Yes → Use train_ddp.py with DDP
   │   └─ No  → Use train.py (single GPU)
@@ -27,6 +32,14 @@ Start
       ├─ Yes → Use SwiGLU
       └─ No  → Standard MLP is fine
 ```
+
+## Architecture Selection
+
+| Architecture | Use Case | Output |
+|--------------|----------|--------|
+| `LocPointTransformer` | Standard action segmentation | Segments (start, end) |
+| `SnapFormer` | Point/instant events (snaps, clicks, impacts) | Points (time only) |
+| `TBTFormer` | Noisy annotations, uncertain boundaries | Segments with uncertainty |
 
 ## Common Scenarios
 
@@ -172,6 +185,51 @@ torchrun --nproc_per_node=8 --nnodes=4 --node_rank=$RANK \
     --master_addr=$MASTER_ADDR --master_port=29500 \
     train_ddp.py config.yaml --amp --accum-steps 2
 ```
+
+### 8. Point/Instant Event Detection (SnapFormer)
+
+**Goal**: Detect events with near-zero duration (snaps, clicks, keystrokes, impacts)
+
+```yaml
+model:
+  meta_arch: "SnapFormer"
+  fpn_type: "cs_fpn"              # Cross-scale FPN recommended
+  backbone_type: convTransformerv2
+  backbone:
+    use_rope: true
+    use_flash_attn: true
+```
+
+**Examples**: Football snap detection, keystroke detection, ball impact detection
+
+**Key differences from ActionFormer**:
+- Outputs points (single timestamp) instead of segments
+- Uses Gaussian heatmap regression instead of boundary regression
+- Inference via peak detection
+
+### 9. Noisy Annotations / Uncertain Boundaries (TBTFormer)
+
+**Goal**: Handle datasets with annotation noise or ambiguous action boundaries
+
+```yaml
+model:
+  meta_arch: "TBTFormer"
+  fpn_type: "cs_fpn"
+  reg_max: 16                     # Distribution bins
+  dfl_weight: 0.25                # DFL loss weight
+  backbone_type: convTransformerv2
+  backbone:
+    n_head: 16                    # Scaled backbone (optional)
+    use_rope: true
+    use_flash_attn: true
+```
+
+**Examples**: Crowdsourced annotations, ambiguous action transitions, fine-grained actions
+
+**Key differences from ActionFormer**:
+- Predicts probability distribution over boundary locations
+- Uses Distribution Focal Loss for smoother learning
+- Better handles label noise (±1-2 frame errors)
 
 ## Dataset-Specific Recommendations
 
